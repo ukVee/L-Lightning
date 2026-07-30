@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -11,6 +13,8 @@ pub struct CommandLayer {
     min_gap: Arc<Mutex<Duration>>,
     pending: Arc<Mutex<Option<DeviceState>>>,
     last_sent: Arc<Mutex<Instant>>,
+    shutdown_flag: Arc<AtomicBool>,
+    flush_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl CommandLayer {
@@ -18,15 +22,26 @@ impl CommandLayer {
         let min_gap = Arc::new(Mutex::new(Duration::from_millis(1100)));
         let pending = Arc::new(Mutex::new(None));
         let last_sent = Arc::new(Mutex::new(Instant::now()));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let flush_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>> =
+            Arc::new(StdMutex::new(None));
 
         let conn_c = conn.clone();
         let pending_c = pending.clone();
         let last_sent_c = last_sent.clone();
         let min_gap_c = min_gap.clone();
+        let shutdown_flag_c = shutdown_flag.clone();
+        let flush_handle_c = flush_handle.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                if shutdown_flag_c.load(Ordering::SeqCst) {
+                    if let Some(s) = pending_c.lock().await.take() {
+                        conn_c.set(s);
+                    }
+                    break;
+                }
                 let gap = *min_gap_c.lock().await;
                 let mut last = last_sent_c.lock().await;
                 if last.elapsed() >= gap {
@@ -39,11 +54,15 @@ impl CommandLayer {
             }
         });
 
+        *flush_handle_c.lock().unwrap() = Some(handle);
+
         Self {
             conn,
             min_gap,
             pending,
             last_sent,
+            shutdown_flag,
+            flush_handle,
         }
     }
 
@@ -81,6 +100,15 @@ impl CommandLayer {
 
     pub async fn device_state(&self) -> DeviceState {
         self.conn.device_state().await
+    }
+
+    pub async fn shutdown(self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        let handle = self.flush_handle.lock().unwrap().take();
+        if let Some(h) = handle {
+            let _ = h.await;
+        }
+        self.conn.shutdown().await;
     }
 
     pub async fn discover_min_gap(&self) -> Duration {

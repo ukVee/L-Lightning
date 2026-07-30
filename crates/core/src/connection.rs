@@ -38,9 +38,10 @@ enum Cmd {
 
 #[derive(Clone)]
 pub struct Connection {
-    cmd_tx: mpsc::UnboundedSender<Cmd>,
+    cmd_tx: mpsc::Sender<Cmd>,
     state_rx: watch::Receiver<ConnState>,
     last_state: Arc<Mutex<DeviceState>>,
+    fsm_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Connection {
@@ -53,9 +54,10 @@ impl Connection {
             .next()
             .ok_or("no Bluetooth adapter found")?;
 
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(8);
         let (state_tx, state_rx) = watch::channel(ConnState::Idle);
         let last_state = Arc::new(Mutex::new(DeviceState::default()));
+        let fsm_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
         let fsm = Fsm {
             adapter,
@@ -67,17 +69,19 @@ impl Connection {
             last_state: last_state.clone(),
         };
 
-        tokio::spawn(fsm.run());
+        let handle = tokio::spawn(fsm.run());
+        *fsm_handle.lock().await = Some(handle);
 
         Ok(Self {
             cmd_tx,
             state_rx,
             last_state,
+            fsm_handle,
         })
     }
 
     pub fn set(&self, state: DeviceState) {
-        let _ = self.cmd_tx.send(Cmd::ApplyState(state));
+        let _ = self.cmd_tx.try_send(Cmd::ApplyState(state));
     }
 
     pub fn state(&self) -> ConnState {
@@ -91,6 +95,13 @@ impl Connection {
     pub async fn device_state(&self) -> DeviceState {
         self.last_state.lock().await.clone()
     }
+
+    pub async fn shutdown(self) {
+        let _ = self.cmd_tx.try_send(Cmd::Stop);
+        if let Some(h) = self.fsm_handle.lock().await.take() {
+            let _ = h.await;
+        }
+    }
 }
 
 struct Fsm {
@@ -98,7 +109,7 @@ struct Fsm {
     peripheral: Option<Peripheral>,
     write_char: Option<btleplug::api::Characteristic>,
     write_type: Option<btleplug::api::WriteType>,
-    cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    cmd_rx: mpsc::Receiver<Cmd>,
     state_tx: watch::Sender<ConnState>,
     last_state: Arc<Mutex<DeviceState>>,
 }
