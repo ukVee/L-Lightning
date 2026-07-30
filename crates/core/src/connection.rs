@@ -11,6 +11,7 @@ use crate::protocol;
 const INTER_WRITE_MS: u64 = 1100;
 const SCAN_TIMEOUT_SECS: u64 = 60;
 const IDLE_DISCONNECT_SECS: u64 = 30;
+const BLE_WRITE_TIMEOUT_MS: u64 = 5000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnState {
@@ -245,7 +246,13 @@ impl Fsm {
                 self.write_type = Some(wt);
 
                 let ls = self.last_state.lock().await.clone();
-                self.replay_state(dev, &ls).await;
+                if self.replay_state(dev, &ls).await.is_err() {
+                    eprintln!("[l-lightning] replay write failed, disconnecting");
+                    let _ = dev.disconnect().await;
+                    self.peripheral = None;
+                    self.transition(ConnState::Idle);
+                    return;
+                }
 
                 tokio::time::sleep(Duration::from_millis(1500)).await;
 
@@ -269,49 +276,82 @@ impl Fsm {
 
         if state.power != old.power {
             if state.power {
-                dev.write(ch, &protocol::power_on(), wtype).await.map_err(|_| ())?;
+                tokio::time::timeout(
+                    Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                    dev.write(ch, &protocol::power_on(), wtype),
+                )
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
                 tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
             } else {
-                dev.write(ch, &protocol::power_off(), wtype).await.map_err(|_| ())?;
+                tokio::time::timeout(
+                    Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                    dev.write(ch, &protocol::power_off(), wtype),
+                )
+                .await
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
                 tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
                 return Ok(());
             }
         }
 
         if state.brightness != old.brightness {
-            dev.write(ch, &protocol::set_brightness(state.brightness), wtype)
-                .await
-                .map_err(|_| ())?;
+            tokio::time::timeout(
+                Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                dev.write(ch, &protocol::set_brightness(state.brightness), wtype),
+            )
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
             tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
         }
 
         if state.r != old.r || state.g != old.g || state.b != old.b {
-            dev.write(ch, &protocol::set_color(state.r, state.g, state.b), wtype)
-                .await
-                .map_err(|_| ())?;
+            tokio::time::timeout(
+                Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                dev.write(ch, &protocol::set_color(state.r, state.g, state.b), wtype),
+            )
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
             tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
         }
 
         Ok(())
     }
 
-    async fn replay_state(&self, dev: &Peripheral, state: &DeviceState) {
-        let ch = match self.write_char.as_ref() {
-            Some(c) => c,
-            None => return,
-        };
-        let wtype = match self.write_type {
-            Some(wt) => wt,
-            None => return,
-        };
+    async fn replay_state(&self, dev: &Peripheral, state: &DeviceState) -> Result<(), ()> {
+        let ch = self.write_char.as_ref().ok_or(())?;
+        let wtype = self.write_type.ok_or(())?;
 
         if state.power && state.brightness > 0 {
-            let _ = dev.write(ch, &protocol::power_on(), wtype).await;
+            tokio::time::timeout(
+                Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                dev.write(ch, &protocol::power_on(), wtype),
+            )
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
             tokio::time::sleep(Duration::from_millis(700)).await;
-            let _ = dev.write(ch, &protocol::set_brightness(state.brightness), wtype).await;
+            tokio::time::timeout(
+                Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                dev.write(ch, &protocol::set_brightness(state.brightness), wtype),
+            )
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
             tokio::time::sleep(Duration::from_millis(700)).await;
-            let _ = dev.write(ch, &protocol::set_color(state.r, state.g, state.b), wtype).await;
+            tokio::time::timeout(
+                Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                dev.write(ch, &protocol::set_color(state.r, state.g, state.b), wtype),
+            )
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
             tokio::time::sleep(Duration::from_millis(700)).await;
         }
+        Ok(())
     }
 }

@@ -11,6 +11,7 @@ pub const WRITE_UUID: Uuid = Uuid::from_u128(0x0000fff3_0000_1000_8000_00805f9b3
 pub const NOTIFY_UUID: Uuid = Uuid::from_u128(0x0000fff4_0000_1000_8000_00805f9b34fb);
 
 const INTER_WRITE_DELAY_MS: u64 = 1100;
+const BLE_WRITE_TIMEOUT_MS: u64 = 5000;
 
 pub async fn find_elk(central: &Adapter) -> Result<Option<Peripheral>, btleplug::Error> {
     for p in central.peripherals().await? {
@@ -42,15 +43,34 @@ pub async fn establish_gatt(dev: &Peripheral) -> Result<(), Box<dyn Error>> {
     time::sleep(Duration::from_millis(1000)).await;
 
     for attempt in 1..=4u32 {
-        if let Err(e) = dev.connect().await {
-            eprintln!("    attempt {attempt}/4: connect returned '{e}' (checking link anyway)...");
+        match time::timeout(
+            Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+            dev.connect(),
+        )
+        .await
+        {
+            Ok(Err(e)) => {
+                eprintln!(
+                    "    attempt {attempt}/4: connect returned '{e}' (checking link anyway)..."
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "    attempt {attempt}/4: connect timed out: {e} (checking link anyway)..."
+                );
+            }
+            _ => {}
         }
 
         time::sleep(Duration::from_millis(2000)).await;
 
         for _ in 0..40 {
             if dev.is_connected().await.unwrap_or(false) {
-                let _ = dev.discover_services().await;
+                let _ = time::timeout(
+                    Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                    dev.discover_services(),
+                )
+                .await;
                 if dev.characteristics().iter().any(|c| c.uuid == WRITE_UUID) {
                     return Ok(());
                 }
@@ -89,9 +109,23 @@ pub async fn write_command(
     wtype: WriteType,
     bytes: &[u8],
 ) -> Result<(), Box<dyn Error>> {
-    if let Err(_e) = dev.write(ch, bytes, wtype).await {
-        ensure_connected(dev).await?;
-        dev.write(ch, bytes, wtype).await?;
+    let first = time::timeout(
+        Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+        dev.write(ch, bytes, wtype),
+    )
+    .await;
+    match first {
+        Ok(Ok(())) => {}
+        _ => {
+            ensure_connected(dev).await?;
+            time::timeout(
+                Duration::from_millis(BLE_WRITE_TIMEOUT_MS),
+                dev.write(ch, bytes, wtype),
+            )
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+        }
     }
     time::sleep(Duration::from_millis(INTER_WRITE_DELAY_MS)).await;
     Ok(())
