@@ -1,6 +1,7 @@
 use l_lightning_core::rpc::{Notification, Request, Response};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -61,83 +62,101 @@ enum RpcAction {
 
 impl RpcClient {
     pub async fn connect(event_tx: mpsc::UnboundedSender<DaemonEvent>) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = socket_path();
-        let stream = UnixStream::connect(&path).await?;
-
-        let (reader, mut writer) = stream.into_split();
-        let buf = BufReader::new(reader);
-        let mut lines = buf.lines();
-
         let (action_tx, mut action_rx) = mpsc::unbounded_channel::<RpcAction>();
 
         tokio::spawn(async move {
-
+            let mut backoff = 1u64;
             loop {
-                tokio::select! {
-                    line = lines.next_line() => {
-                        match line {
-                            Ok(Some(line)) => {
-                                let trimmed = line.trim();
-                                if trimmed.is_empty() {
-                                    continue;
-                                }
+                let path = socket_path();
+                match UnixStream::connect(&path).await {
+                    Ok(stream) => {
+                        backoff = 1;
+                        let (reader, mut writer) = stream.into_split();
+                        let buf = BufReader::new(reader);
+                        let mut lines = buf.lines();
 
-                                if let Ok(notif) = serde_json::from_str::<Notification>(trimmed) {
-                                    match notif.method.as_str() {
-                                        "state" => {
-                                            if let Some(s) = parse_state(&notif.params) {
-                                                let _ = event_tx.send(DaemonEvent::State(s));
+                        let _ = event_tx.send(DaemonEvent::Connection("Connected".into()));
+
+                        loop {
+                            tokio::select! {
+                                line = lines.next_line() => {
+                                    match line {
+                                        Ok(Some(line)) => {
+                                            let trimmed = line.trim();
+                                            if trimmed.is_empty() {
+                                                continue;
+                                            }
+
+                                            if let Ok(notif) = serde_json::from_str::<Notification>(trimmed) {
+                                                match notif.method.as_str() {
+                                                    "state" => {
+                                                        if let Some(s) = parse_state(&notif.params) {
+                                                            let _ = event_tx.send(DaemonEvent::State(s));
+                                                        }
+                                                    }
+                                                    "connection" => {
+                                                        if let Some(s) = notif.params.get("state").and_then(|v| v.as_str()) {
+                                                            let _ = event_tx.send(DaemonEvent::Connection(s.to_string()));
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            } else if let Ok(resp) = serde_json::from_str::<Response>(trimmed) {
+                                                match resp.result {
+                                                    Some(result) => {
+                                                        let _ = event_tx.send(DaemonEvent::Response {
+                                                            id: resp.id,
+                                                            result,
+                                                        });
+                                                    }
+                                                    None => {
+                                                        if let Some(err) = resp.error {
+                                                            let _ = event_tx.send(DaemonEvent::Error {
+                                                                id: resp.id,
+                                                                message: err.message,
+                                                            });
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
-                                        "connection" => {
-                                            if let Some(s) = notif.params.get("state").and_then(|v| v.as_str()) {
-                                                let _ = event_tx.send(DaemonEvent::Connection(s.to_string()));
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                } else if let Ok(resp) = serde_json::from_str::<Response>(trimmed) {
-                                    match resp.result {
-                                        Some(result) => {
-                                            let _ = event_tx.send(DaemonEvent::Response {
-                                                id: resp.id,
-                                                result,
-                                            });
-                                        }
-                                        None => {
-                                            if let Some(err) = resp.error {
-                                                let _ = event_tx.send(DaemonEvent::Error {
-                                                    id: resp.id,
-                                                    message: err.message,
-                                                });
-                                            }
+                                        Ok(None) | Err(_) => {
+                                            let _ = event_tx.send(DaemonEvent::Disconnected);
+                                            let _ = event_tx.send(DaemonEvent::Connection("Disconnected".into()));
+                                            break;
                                         }
                                     }
                                 }
-                            }
-                            Ok(None) | Err(_) => {
-                                let _ = event_tx.send(DaemonEvent::Disconnected);
-                                break;
+                                action = action_rx.recv() => {
+                                    match action {
+                                        Some(RpcAction::Request { id, method, params }) => {
+                                            let req = Request {
+                                                jsonrpc: "2.0".to_string(),
+                                                method,
+                                                params,
+                                                id,
+                                            };
+                                            let mut bytes = serde_json::to_vec(&req).unwrap_or_default();
+                                            bytes.push(b'\n');
+                                            if writer.write_all(&bytes).await.is_err() {
+                                                let _ = event_tx.send(DaemonEvent::Disconnected);
+                                                let _ = event_tx.send(DaemonEvent::Connection("Disconnected".into()));
+                                                break;
+                                            }
+                                        }
+                                        None => return,
+                                    }
+                                }
                             }
                         }
                     }
-                    action = action_rx.recv() => {
-                        match action {
-                            Some(RpcAction::Request { id, method, params }) => {
-                                let req = Request {
-                                    jsonrpc: "2.0".to_string(),
-                                    method,
-                                    params,
-                                    id,
-                                };
-                                let mut bytes = serde_json::to_vec(&req).unwrap_or_default();
-                                bytes.push(b'\n');
-                                let _ = writer.write_all(&bytes).await;
-                            }
-                            None => break,
-                        }
+                    Err(e) => {
+                        eprintln!("[tui] connect failed: {e}, retrying in {backoff}s");
                     }
                 }
+
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
             }
         });
 
