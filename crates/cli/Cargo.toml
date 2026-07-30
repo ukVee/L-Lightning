@@ -1,0 +1,12 @@
+[package]
+name = "l-lightning"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "l-lightning"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "l-lightning-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.35"
+egui = "0.35"
+l-lightning-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

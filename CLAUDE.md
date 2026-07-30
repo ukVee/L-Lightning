@@ -8,19 +8,38 @@ garden at `~/soft-fig_garden/projects/l-lightning/`. **This file is authoritativ
 for code.**
 
 ## Layout
-- `poc/` — proof-of-concept binary crate (`l-lightning-poc`, [btleplug]). Scans for
-  the controller, connects, and drives a power/brightness/colour sequence. A
-  throwaway spike; the real workspace is defined in the spec phase.
+- `crates/core` — library crate (`l-lightning-core`): ELK-BLEDOM protocol encoder,
+  connection state machine (scan → connect → reconnect with exponential backoff),
+  command layer with coalescing throttle.
+- `crates/daemon` — binary crate (`l-lightningd`): Unix-socket JSON-RPC 2.0 server
+  (NDJSON framing) wrapping the core. Full method surface: `get_state`, `set_power`,
+  `set_brightness`, `set_color`, `list_presets`/`save`/`delete`/`apply_preset`,
+  `get_config`/`set_config`, `start_effect`/`stop_effect` (breathe / color_cycle /
+  strobe / fade_to), `reconnect`/`rescan`. Notifications: `state`, `connection`.
+  Config at `$XDG_CONFIG_HOME/l-lightning/config.toml`.
+- `crates/cli` — binary crate (`l-lightning`): thin JSON-RPC client over the
+  Unix socket. Auto-spawns the daemon if not running. Subcommands: `status`, `on`,
+  `off`, `brightness`, `color`, `presets`, `preset save|delete|apply`, `effect
+  start|stop`, `config`, `config color-order|device`, `reconnect`.
+- `poc/` — proof-of-concept binary crate (`l-lightning-poc`, [btleplug]). Frozen.
+- `crates/tui` — native GUI (egui + eframe + winit): power toggle, brightness/RGB
+  sliders + color swatch, presets (list/save/apply/delete), effects panel.
+  Touch-native via winit. Launched via `l-lightning tui`.
+- `ui/` — spike: terminal-kit touch validation experiment (results: touch tap works,
+  drag doesn't under Wayfire). Kept for reference.
 
-Planned post-spec (layout TBD): a `core` crate (BLE + protocol + connection state
-machine), a small daemon/bridge, and a Node UI.
+## Build & run
+```sh
+cargo build --release --workspace
+./target/release/l-lightningd
+```
+Power-cycle the strip when it prints `listening on ...`. Requires BlueZ running
+and the phone's Bluetooth **off** (one central at a time).
 
-## Build & run the POC
+The POC is still runnable via:
 ```sh
 cargo run --manifest-path poc/Cargo.toml
 ```
-Power-cycle the strip when it prints `scanning`, and keep it near the machine.
-Requires BlueZ running and the phone's Bluetooth **off** (one central at a time).
 
 ## The device
 - Name `ELK-BLEDOM06`, address `BE:67:00:A5:CC:56` (the POC matches any
@@ -45,3 +64,4 @@ Requires BlueZ running and the phone's Bluetooth **off** (one central at a time)
 - Don't `bluetoothctl remove` the device — it wipes BlueZ's cached GATT.
 
 [btleplug]: https://github.com/deviceplug/btleplug
+[terminal-kit]: https://github.com/cronvel/terminal-kit

@@ -1,0 +1,17 @@
+{
+  "name": "ui",
+  "version": "1.0.0",
+  "description": "l-lightning Node TUI (terminal-kit + JSON-RPC client)",
+  "main": "spike-touch.mjs",
+  "scripts": {
+    "start": "node spike-touch.mjs",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "terminal-kit": "^3.1.4"
+  }
+}

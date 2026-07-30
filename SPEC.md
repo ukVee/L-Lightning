@@ -1,7 +1,7 @@
-# l-lightning — spec v1
+# l-lightning — spec v1.1
 
 Standalone on-device controller for a generic **ELK-BLEDOM** Bluetooth-LE RGB LED
-strip. Replaces the lost remote and the dead vendor app. **Rust core daemon + Node
+strip. Replaces the lost remote and the dead vendor app. **Rust core daemon + egui
 TUI**, talking over a local Unix socket.
 
 Framing/status live in the garden (`~/soft-fig_garden/projects/l-lightning/`); this
@@ -19,18 +19,18 @@ note `notes/001-poc-elk-bledom.md`.
 ## Architecture
 
 ```
-┌──────────────────┐   JSON-RPC 2.0 (NDJSON)   ┌───────────────────────────┐
-│  Node TUI (ui/)  │ ◄───── Unix socket ─────► │  l-lightningd (Rust)      │
-│  terminal-kit    │  $XDG_RUNTIME_DIR/.sock    │  ┌─────────────────────┐  │
-│  sliders/picker  │                            │  │ core: BLE+protocol  │  │
-│  presets/effects │                            │  │ connection FSM      │  │
-└──────────────────┘                            │  │ effects engine      │  │
-                                                │  │ presets/config store│  │
-                                                │  └─────────┬───────────┘  │
-                                                └────────────┼──────────────┘
-                                                     btleplug │ BlueZ/D-Bus
-                                                              ▼
-                                                     ELK-BLEDOM controller
+┌──────────────────────┐   JSON-RPC 2.0 (NDJSON)   ┌───────────────────────────┐
+│  egui TUI (tui/)     │ ◄───── Unix socket ─────► │  l-lightningd (Rust)      │
+│  eframe + winit      │  $XDG_RUNTIME_DIR/.sock    │  ┌─────────────────────┐  │
+│  sliders/picker      │                            │  │ core: BLE+protocol  │  │
+│  presets/effects     │                            │  │ connection FSM      │  │
+└──────────────────────┘                            │  │ effects engine      │  │
+                                                    │  │ presets/config store│  │
+                                                    │  └─────────┬───────────┘  │
+                                                    └────────────┼──────────────┘
+                                                         btleplug │ BlueZ/D-Bus
+                                                                  ▼
+                                                         ELK-BLEDOM controller
 ```
 
 - **`crates/core`** (`l-lightning-core`, lib) — btleplug BLE, ELK protocol encoder,
@@ -96,28 +96,30 @@ Task that writes frames on a timer; stops on any manual command or `stop_effect`
 - `breathe` (sine brightness), `color_cycle` (hue rotation), `strobe` (on/off),
   `fade_to` (ramp to a target). Each takes a `speed` and optional params.
 
-## Node TUI (ui/)
+## egui TUI (crates/tui/)
 
-Framework: **terminal-kit** — native mouse (click/drag) support + 24-bit color for a
-real color picker, actively maintained. (Ink is the fallback if we drop heavy touch;
-its mouse support is weak.)
+Framework: **egui + eframe** (winit backend). Touch-native — winit handles
+touch→pointer translation properly under Wayland/wlroots.
 
-Screens/widgets:
-- **Main**: power toggle, brightness slider, RGB sliders + color swatch/wheel, live
-  state readout, connection indicator.
+Binary: `l-lightning-tui`. Launched via `l-lightning tui` (CLI ensures daemon
+running first).
+
+Tabs:
+- **Main**: power toggle, brightness slider, RGB sliders + colour swatch, live
+  state, connection indicator.
 - **Presets**: list, apply, save current, delete.
-- **Effects**: pick kind + speed, start/stop.
-- **Settings**: device, color order, reconnect/rescan.
+- **Effects**: pick kind (breathe/color_cycle/strobe/fade_to) + start/stop.
 
-Touch/mouse: draggable sliders, tappable swatches, large hit targets.
+Event-driven state sync: daemon pushes `state` + `connection` notifications;
+TUI drains them each frame via `std::mpsc::try_recv`. RPC types shared via
+`crates/core/src/rpc.rs`.
 
-## Risks & validation (do these EARLY)
+## Risks & validation
 
-1. **Touch in the terminal** (highest risk). Under Wayfire/wlroots, touch is not
-   auto-delivered to terminals as pointer events. First UI slice is a spike: does a
-   finger-drag move a terminal-kit slider in the user's terminal? If not, options:
-   (a) enable touch→pointer emulation in Wayfire, (b) route through the existing
-   touch-drawer infra, (c) revisit UI form. Decide before building the full TUI.
+1. ~~**Touch in the terminal** (highest risk). Under Wayfire/wlroots, touch is not
+   auto-delivered to terminals as pointer events.~~ CONFIRMED (2026-07-29):
+   finger-drag does NOT fire MOUSE_DRAG in terminal-kit under Wayfire. Pivoted
+   to egui/eframe (winit handles touch→pointer properly).
 2. **Write throughput**: find the min reliable inter-write gap for smooth slider
    drags without dropping the link.
 3. **Multiple clients**: daemon must fan out notifications and serialize device writes.
@@ -133,20 +135,20 @@ Touch/mouse: draggable sliders, tappable swatches, large hit targets.
 - 2.6 Effects engine.
 - 2.7 `l-lightning` CLI client (test harness + launcher).
 
-**M3 — Node TUI**
-- 3.0 Touch/mouse validation spike (see Risks #1).
-- 3.1 Socket client + live state sync.
-- 3.2 Main screen (power, brightness, color).
-- 3.3 Presets screen.
-- 3.4 Effects panel.
-- 3.5 Settings; touch polish (big targets, drag sliders).
+**M3 — egui TUI**
+- 3.0 Touch/mouse validation spike (terminal-kit → confirmed: touch drag broken under Wayfire)
+- 3.1 Pivot to egui + eframe: `crates/tui` crate, daemon JSON-RPC client, Control/Presets/Effects tabs
+- 3.2 RPC types moved to `crates/core/src/rpc.rs` (shared)
+- 3.3 CLI `tui` subcommand (ensures daemon + spawns TUI)
 
 **M4 — packaging**
 - 4.1 `l-lightning` launcher auto-spawns the daemon (standalone one-command start).
 - 4.2 Optional systemd user service for the daemon.
 - 4.3 Docs (README/CLAUDE refresh, garden status bump).
 
-## Open questions
+## Open questions (both resolved, independent then build)
 
-- Effect set for v1 — the four above, or a different starter set?
-- Should the daemon autostart at login (systemd user service), or only on first UI launch?
+- **Effect set for v1** → keep all four: `breathe`, `color_cycle`, `strobe`, `fade_to`.
+- **Daemon autostart** → two layers: the `l-lightning` launcher spawns the daemon
+  on first UI open (4.1); and a systemd user service (`l-lightningd.service`,
+  bombadil-linked, `Wants=bluetooth.target`) keeps the daemon running across sessions (4.2).
