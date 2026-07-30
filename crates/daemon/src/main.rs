@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use l_lightning_core::command::CommandLayer;
 use l_lightning_core::connection::{ConnState, Connection, DeviceState};
@@ -7,7 +8,7 @@ use l_lightning_core::rpc::{Notification, Request, Response};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 mod config;
 mod effect;
@@ -20,6 +21,7 @@ const NOTIFY_BUF: usize = 32;
 struct Daemon {
     cmd_layer: CommandLayer,
     notify_tx: broadcast::Sender<Notification>,
+    save_tx: mpsc::Sender<Config>,
     current: Mutex<DeviceState>,
     presets: Mutex<Vec<Preset>>,
     next_preset_id: Mutex<u64>,
@@ -28,7 +30,7 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(cmd_layer: CommandLayer, config: &Config) -> Self {
+    fn new(cmd_layer: CommandLayer, config: &Config, save_tx: mpsc::Sender<Config>) -> Self {
         let (notify_tx, _) = broadcast::channel(NOTIFY_BUF);
 
         let current = config.last_state.clone().unwrap_or_default();
@@ -42,6 +44,7 @@ impl Daemon {
         Self {
             cmd_layer,
             notify_tx,
+            save_tx,
             current: Mutex::new(current),
             presets: Mutex::new(config.presets.clone()),
             next_preset_id: Mutex::new(max_id + 1),
@@ -260,7 +263,7 @@ impl Daemon {
 
     fn save_current_config(&self, state: DeviceState) {
         let presets = self.presets.lock().unwrap().clone();
-        config::save(&Config {
+        let _ = self.save_tx.try_send(Config {
             device: std::env::var("L_LIGHTNING_DEVICE").ok(),
             color_order: None,
             presets,
@@ -305,7 +308,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::new().await?;
     let cmd_layer = CommandLayer::new(conn);
 
-    let daemon = Arc::new(Daemon::new(cmd_layer, &config));
+    let (save_tx, mut save_rx) = mpsc::channel::<Config>(1);
+    let daemon = Arc::new(Daemon::new(cmd_layer, &config, save_tx));
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut pending: Option<Config> = None;
+        loop {
+            let closed = tokio::select! {
+                cfg = save_rx.recv() => {
+                    match cfg {
+                        Some(c) => { pending = Some(c); false }
+                        None => true,
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Some(ref c) = pending {
+                        config::save(c);
+                        pending = None;
+                    }
+                    false
+                }
+            };
+            if closed {
+                if let Some(ref c) = pending {
+                    config::save(c);
+                }
+                break;
+            }
+        }
+    });
 
     if let Some(ref last_state) = config.last_state {
         if last_state.power || last_state.brightness > 0 {
