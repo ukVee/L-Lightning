@@ -8,7 +8,7 @@ use l_lightning_core::rpc::{Notification, Request, Response};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Semaphore};
 
 mod config;
 mod effect;
@@ -347,6 +347,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let sp = socket_path();
     if sp.exists() {
+        if let Ok(_stream) = UnixStream::connect(&sp).await {
+            eprintln!("[l-lightningd] daemon already running on {}", sp.display());
+            return Err("already running".into());
+        }
         std::fs::remove_file(&sp)?;
     }
 
@@ -355,10 +359,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     spawn_connection_watcher(daemon.clone());
 
+    let client_sem = Arc::new(Semaphore::new(32));
     loop {
         let (stream, _) = listener.accept().await?;
+        let permit = match client_sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break Ok(()),
+        };
         let d = daemon.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_client(stream, d).await {
                 eprintln!("[l-lightningd] client error: {e}");
             }
