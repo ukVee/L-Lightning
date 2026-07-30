@@ -74,33 +74,33 @@ impl Daemon {
         })
     }
 
-    fn set_power(&self, on: bool) {
+    async fn set_power(&self, on: bool) {
         self.stop_current_effect();
         let state = {
             let mut cur = self.current.lock().unwrap();
             cur.power = on;
             cur.clone()
         };
-        self.cmd_layer.apply(state.clone());
+        self.cmd_layer.apply(state.clone()).await;
         let notif = Notification::new("state", self.get_state());
         let _ = self.notify_tx.send(notif);
         self.save_current_config(state);
     }
 
-    fn set_brightness(&self, pct: u8) {
+    async fn set_brightness(&self, pct: u8) {
         self.stop_current_effect();
         let state = {
             let mut cur = self.current.lock().unwrap();
             cur.brightness = pct.min(100);
             cur.clone()
         };
-        self.cmd_layer.apply(state.clone());
+        self.cmd_layer.apply(state.clone()).await;
         let notif = Notification::new("state", self.get_state());
         let _ = self.notify_tx.send(notif);
         self.save_current_config(state);
     }
 
-    fn set_color(&self, r: u8, g: u8, b: u8) {
+    async fn set_color(&self, r: u8, g: u8, b: u8) {
         self.stop_current_effect();
         let state = {
             let mut cur = self.current.lock().unwrap();
@@ -109,7 +109,7 @@ impl Daemon {
             cur.b = b;
             cur.clone()
         };
-        self.cmd_layer.apply(state.clone());
+        self.cmd_layer.apply(state.clone()).await;
         let notif = Notification::new("state", self.get_state());
         let _ = self.notify_tx.send(notif);
         self.save_current_config(state);
@@ -184,7 +184,7 @@ impl Daemon {
         }
     }
 
-    fn apply_preset(&self, id: u64) -> Option<Value> {
+    async fn apply_preset(&self, id: u64) -> Option<Value> {
         let preset = {
             let presets = self.presets.lock().unwrap();
             presets.iter().find(|p| p.id == id).cloned()
@@ -200,7 +200,7 @@ impl Daemon {
                     cur.b = p.b;
                     cur.clone()
                 };
-                self.cmd_layer.apply(state.clone());
+                self.cmd_layer.apply(state.clone()).await;
                 let notif = Notification::new("state", self.get_state());
                 let _ = self.notify_tx.send(notif);
                 self.save_current_config(state);
@@ -309,7 +309,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref last_state) = config.last_state {
         if last_state.power || last_state.brightness > 0 {
-            daemon.cmd_layer.apply(last_state.clone());
+            daemon.cmd_layer.apply(last_state.clone()).await;
         }
     }
 
@@ -375,7 +375,7 @@ async fn handle_client(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        let resp = dispatch(trimmed, &daemon);
+                        let resp = dispatch(trimmed, &daemon).await;
                         let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
                         bytes.push(b'\n');
                         let _ = writer.write_all(&bytes).await;
@@ -401,7 +401,7 @@ async fn handle_client(
     Ok(())
 }
 
-fn dispatch(line: &str, daemon: &Daemon) -> Response {
+async fn dispatch(line: &str, daemon: &Daemon) -> Response {
     let req: Request = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => return Response::err(Value::Null, -32700, format!("Parse error: {e}")),
@@ -418,7 +418,7 @@ fn dispatch(line: &str, daemon: &Daemon) -> Response {
             let on = req.params.get("on").and_then(|v| v.as_bool());
             match on {
                 Some(on) => {
-                    daemon.set_power(on);
+                    daemon.set_power(on).await;
                     Response::ok(req.id, daemon.get_state())
                 }
                 None => Response::err(req.id, -32602, "Invalid params: 'on' (bool) required"),
@@ -429,7 +429,7 @@ fn dispatch(line: &str, daemon: &Daemon) -> Response {
             let pct = req.params.get("pct").and_then(|v| v.as_u64());
             match pct {
                 Some(p) if p <= 100 => {
-                    daemon.set_brightness(p as u8);
+                    daemon.set_brightness(p as u8).await;
                     Response::ok(req.id, daemon.get_state())
                 }
                 Some(_) => Response::err(req.id, -32602, "Invalid params: pct must be 0-100"),
@@ -443,7 +443,7 @@ fn dispatch(line: &str, daemon: &Daemon) -> Response {
             let b = req.params.get("b").and_then(|v| v.as_u64());
             match (r, g, b) {
                 (Some(r), Some(g), Some(b)) if r <= 255 && g <= 255 && b <= 255 => {
-                    daemon.set_color(r as u8, g as u8, b as u8);
+                    daemon.set_color(r as u8, g as u8, b as u8).await;
                     Response::ok(req.id, daemon.get_state())
                 }
                 _ => Response::err(req.id, -32602, "Invalid params: 'r','g','b' (0-255) required"),
@@ -452,7 +452,7 @@ fn dispatch(line: &str, daemon: &Daemon) -> Response {
 
         "reconnect" | "rescan" => {
             let state = daemon.current.lock().unwrap().clone();
-            daemon.cmd_layer.apply(state);
+            daemon.cmd_layer.apply(state).await;
             Response::ok(req.id, daemon.get_state())
         }
 
@@ -503,7 +503,7 @@ fn dispatch(line: &str, daemon: &Daemon) -> Response {
         "apply_preset" => {
             let id = req.params.get("id").and_then(|v| v.as_u64());
             match id {
-                Some(id) => match daemon.apply_preset(id) {
+                Some(id) => match daemon.apply_preset(id).await {
                     Some(state) => Response::ok(req.id, state),
                     None => Response::err(req.id, -32602, format!("Preset '{}' not found", id)),
                 },

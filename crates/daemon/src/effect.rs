@@ -87,7 +87,7 @@ async fn run_effect(
             }
         };
 
-        cmd_layer.apply(state.clone());
+        cmd_layer.apply(state.clone()).await;
         tick += 1;
     }
 }

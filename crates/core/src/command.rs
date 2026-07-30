@@ -1,5 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 use crate::connection::{ConnState, Connection, DeviceState};
 
@@ -25,10 +27,10 @@ impl CommandLayer {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                let gap = *min_gap_c.lock().unwrap();
-                let mut last = last_sent_c.lock().unwrap();
+                let gap = *min_gap_c.lock().await;
+                let mut last = last_sent_c.lock().await;
                 if last.elapsed() >= gap {
-                    let mut p = pending_c.lock().unwrap();
+                    let mut p = pending_c.lock().await;
                     if let Some(s) = p.take() {
                         conn_c.set(s);
                         *last = Instant::now();
@@ -45,22 +47,22 @@ impl CommandLayer {
         }
     }
 
-    pub fn set_gap(&self, gap: Duration) {
-        *self.min_gap.lock().unwrap() = gap;
+    pub async fn set_gap(&self, gap: Duration) {
+        *self.min_gap.lock().await = gap;
     }
 
-    pub fn gap(&self) -> Duration {
-        *self.min_gap.lock().unwrap()
+    pub async fn gap(&self) -> Duration {
+        *self.min_gap.lock().await
     }
 
-    pub fn apply(&self, state: DeviceState) {
+    pub async fn apply(&self, state: DeviceState) {
         let now = Instant::now();
-        let gap = *self.min_gap.lock().unwrap();
+        let gap = *self.min_gap.lock().await;
 
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock().await;
         *pending = Some(state);
 
-        let mut last = self.last_sent.lock().unwrap();
+        let mut last = self.last_sent.lock().await;
         if now.duration_since(*last) >= gap {
             if let Some(s) = pending.take() {
                 self.conn.set(s);
@@ -110,10 +112,10 @@ impl CommandLayer {
 
         for &gap_ms in &candidates {
             let gap = Duration::from_millis(gap_ms);
-            self.set_gap(gap);
+            self.set_gap(gap).await;
 
             for state in &test_states {
-                self.apply(state.clone());
+                self.apply(state.clone()).await;
                 tokio::time::sleep(gap).await;
             }
 
