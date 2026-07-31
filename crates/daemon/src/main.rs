@@ -1,12 +1,14 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use l_lightning_core::command::CommandLayer;
 use l_lightning_core::connection::{ConnState, Connection, DeviceState};
 use l_lightning_core::rpc::{Notification, Request, Response};
+use l_lightning_core::socket_path;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
@@ -34,19 +36,30 @@ impl Daemon {
         let (notify_tx, _) = broadcast::channel(NOTIFY_BUF);
 
         let current = config.last_state.clone().unwrap_or_default();
-        let max_id = config
-            .presets
-            .iter()
-            .map(|p| p.id)
-            .max()
-            .unwrap_or(0);
+
+        let mut presets = config.presets.clone();
+        let mut seen = HashSet::new();
+        let mut max_id = 0u64;
+        for p in &mut presets {
+            if p.id == 0 || !seen.insert(p.id) {
+                max_id = max_id.max(p.id);
+                max_id += 1;
+                let old = p.id;
+                p.id = max_id;
+                eprintln!(
+                    "[l-lightningd] preset '{}' id {} collided, reassigned to {}",
+                    p.name, old, max_id
+                );
+            }
+            max_id = max_id.max(p.id);
+        }
 
         Self {
             cmd_layer,
             notify_tx,
             save_tx,
             current: Mutex::new(current),
-            presets: Mutex::new(config.presets.clone()),
+            presets: Mutex::new(presets),
             next_preset_id: Mutex::new(max_id + 1),
             effect_handle: Mutex::new(None),
             effect_label: Mutex::new(None),
@@ -291,17 +304,7 @@ fn conn_state_label(s: &ConnState) -> &str {
     }
 }
 
-fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let mut p = PathBuf::from(dir);
-        p.push("l-lightning");
-        std::fs::create_dir_all(&p).ok();
-        p.push("daemon.sock");
-        p
-    } else {
-        PathBuf::from("/tmp/l-lightning.sock")
-    }
-}
+
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load();
@@ -355,6 +358,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = UnixListener::bind(&sp)?;
+    std::fs::set_permissions(&sp, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("[l-lightningd] listening on {}", sp.display());
 
     spawn_connection_watcher(daemon.clone());
@@ -403,22 +407,30 @@ async fn handle_client(
     stream: UnixStream,
     daemon: Arc<Daemon>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (reader, mut writer) = stream.into_split();
-    let buf = BufReader::new(reader);
-    let mut lines = buf.lines();
+    const MAX_LINE_BYTES: usize = 65536;
+
+    let (mut reader, mut writer) = stream.into_split();
+    let mut buf = BufReader::new(&mut reader);
+    let mut line_buf = Vec::with_capacity(1024);
     let mut notify_rx = daemon.notify_tx.subscribe();
 
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                match line {
+            result = read_line_bounded(&mut buf, &mut line_buf, MAX_LINE_BYTES) => {
+                match result {
                     Ok(Some(line)) => {
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
                         }
                         let resp = dispatch(trimmed, &daemon).await;
-                        let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
+                        let mut bytes = match serde_json::to_vec(&resp) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[l-lightningd] json encode error: {e}");
+                                continue;
+                            }
+                        };
                         bytes.push(b'\n');
                         let _ = writer.write_all(&bytes).await;
                     }
@@ -428,7 +440,13 @@ async fn handle_client(
             notif = notify_rx.recv() => {
                 match notif {
                     Ok(n) => {
-                        let mut bytes = serde_json::to_vec(&n).unwrap_or_default();
+                        let mut bytes = match serde_json::to_vec(&n) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[l-lightningd] json encode error: {e}");
+                                continue;
+                            }
+                        };
                         bytes.push(b'\n');
                         let _ = writer.write_all(&bytes).await;
                     }
@@ -441,6 +459,31 @@ async fn handle_client(
         }
     }
     Ok(())
+}
+
+async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+    rdr: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    buf.clear();
+    let mut chunk = [0u8; 256];
+    loop {
+        let n = rdr.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(if buf.is_empty() { None } else { Some(String::from_utf8_lossy(buf).into_owned()) });
+        }
+        for &b in &chunk[..n] {
+            if b == b'\n' {
+                return Ok(Some(String::from_utf8_lossy(buf).into_owned()));
+            }
+            if buf.len() >= max {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long"));
+            }
+            buf.push(b);
+        }
+    }
 }
 
 async fn dispatch(line: &str, daemon: &Daemon) -> Response {
@@ -496,6 +539,18 @@ async fn dispatch(line: &str, daemon: &Daemon) -> Response {
             let state = daemon.current.lock().unwrap().clone();
             daemon.cmd_layer.apply(state).await;
             Response::ok(req.id, daemon.get_state())
+        }
+
+        "calibrate" => {
+            tokio::task::spawn({
+                let cmd = daemon.cmd_layer.clone();
+                async move {
+                    let min_gap = cmd.discover_min_gap().await;
+                    eprintln!("[l-lightningd] calibration complete: min_gap = {}ms", min_gap.as_millis());
+                    cmd.set_gap(min_gap).await;
+                }
+            });
+            Response::ok(req.id, json!({"status": "calibrating"}))
         }
 
         "list_presets" => Response::ok(req.id, daemon.list_presets()),

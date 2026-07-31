@@ -1871,6 +1871,7 @@ dependencies = [
 name = "l-lightning"
 version = "0.1.0"
 dependencies = [
+ "l-lightning-core",
  "serde_json",
  "tokio",
 ]

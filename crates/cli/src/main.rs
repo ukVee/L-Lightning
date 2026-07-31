@@ -2,20 +2,10 @@ use std::path::PathBuf;
 use std::process::{exit, Command};
 use std::time::Duration;
 
+use l_lightning_core::socket_path;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-
-fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let mut p = PathBuf::from(dir);
-        p.push("l-lightning");
-        p.push("daemon.sock");
-        p
-    } else {
-        PathBuf::from("/tmp/l-lightning.sock")
-    }
-}
 
 fn sibling_bin(name: &str) -> PathBuf {
     let mut p = std::env::current_exe().unwrap_or_default();
@@ -278,6 +268,12 @@ async fn run(args: &[String]) -> Result<(), String> {
         "reconnect" => {
             rpc("reconnect", json!({})).await?;
             println!("reconnect sent");
+        }
+
+        "calibrate" => {
+            let result = rpc("calibrate", json!({})).await?;
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            println!("calibration running — check daemon logs for result");
         }
 
         _ => {

@@ -1,6 +1,23 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub struct ErrorCode;
+
+impl ErrorCode {
+    pub const PARSE_ERROR: i32 = -32700;
+    pub const INVALID_REQUEST: i32 = -32600;
+    pub const METHOD_NOT_FOUND: i32 = -32601;
+    pub const INVALID_PARAMS: i32 = -32602;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Message {
+    Request(Request),
+    Response(Response),
+    Notification(Notification),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     pub jsonrpc: String,

@@ -3,6 +3,7 @@ mod rpc_client;
 
 use app::App;
 use rpc_client::RpcClient;
+use l_lightning_core::socket_path;
 use std::path::PathBuf;
 use std::process::{exit, Command};
 use std::sync::mpsc as std_mpsc;
@@ -18,7 +19,7 @@ fn sibling_bin(name: &str) -> PathBuf {
 }
 
 async fn ensure_daemon() {
-    let path = rpc_client::socket_path();
+    let path = socket_path();
     match UnixStream::connect(&path).await {
         Ok(_) => (),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -71,6 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _rt_guard = rt.enter();
 
+    let bridge_handle = std::thread::spawn(move || {
+        while let Some(event) = event_rx_tokio.blocking_recv() {
+            if event_tx_std.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([480.0, 640.0])
@@ -83,19 +92,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         native_options,
         Box::new(move |_cc| {
             let app = App::new(rpc_client, event_rx_std);
-
-            // bridge events from tokio mpsc → std mpsc
-            std::thread::spawn(move || {
-                while let Some(event) = event_rx_tokio.blocking_recv() {
-                    if event_tx_std.send(event).is_err() {
-                        break;
-                    }
-                }
-            });
-
             Ok(Box::new(app))
         }),
     )?;
+
+    drop(rt);
+    let _ = bridge_handle.join();
 
     Ok(())
 }

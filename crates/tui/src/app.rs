@@ -26,6 +26,7 @@ pub struct App {
     rpc: RpcClient,
     event_rx: std_mpsc::Receiver<DaemonEvent>,
     pending_presets_req: bool,
+    pending_presets_id: Option<Value>,
     current_tab: Tab,
     presets: Vec<PresetInfo>,
     save_preset_name: String,
@@ -38,7 +39,7 @@ impl App {
         rpc: RpcClient,
         event_rx: std_mpsc::Receiver<DaemonEvent>,
     ) -> Self {
-        let app = Self {
+        let mut app = Self {
             state: DaemonState {
                 power: false,
                 brightness: 100,
@@ -51,6 +52,7 @@ impl App {
             rpc,
             event_rx,
             pending_presets_req: false,
+            pending_presets_id: None,
             current_tab: Tab::Control,
             presets: Vec::new(),
             save_preset_name: String::new(),
@@ -58,7 +60,8 @@ impl App {
             connection_status: "Disconnected".into(),
         };
         app.rpc.request("get_state", json!({}));
-        app.rpc.request("list_presets", json!({}));
+        app.pending_presets_id = Some(app.rpc.request("list_presets", json!({})));
+        app.pending_presets_req = true;
         app
     }
 
@@ -71,22 +74,27 @@ impl App {
                 DaemonEvent::Connection(c) => {
                     self.connection_status = c;
                 }
-                DaemonEvent::Response { result, .. } => {
-                    if let Some(arr) = result.as_array() {
-                        self.presets = arr
-                            .iter()
-                            .filter_map(|v| {
-                                Some(PresetInfo {
-                                    id: v.get("id")?.as_u64()?,
-                                    name: v.get("name")?.as_str()?.to_string(),
-                                    r: v.get("rgb")?.get(0)?.as_u64()? as u8,
-                                    g: v.get("rgb")?.get(1)?.as_u64()? as u8,
-                                    b: v.get("rgb")?.get(2)?.as_u64()? as u8,
-                                    brightness: v.get("brightness")?.as_u64()? as u8,
-                                })
-                            })
-                            .collect();
-                        self.pending_presets_req = false;
+                DaemonEvent::Response { id, result } => {
+                    if let Some(ref expected) = self.pending_presets_id {
+                        if id == *expected {
+                            self.pending_presets_id = None;
+                            self.pending_presets_req = false;
+                            if let Some(arr) = result.as_array() {
+                                self.presets = arr
+                                    .iter()
+                                    .filter_map(|v| {
+                                        Some(PresetInfo {
+                                            id: v.get("id")?.as_u64()?,
+                                            name: v.get("name")?.as_str()?.to_string(),
+                                            r: v.get("rgb")?.get(0)?.as_u64()? as u8,
+                                            g: v.get("rgb")?.get(1)?.as_u64()? as u8,
+                                            b: v.get("rgb")?.get(2)?.as_u64()? as u8,
+                                            brightness: v.get("brightness")?.as_u64()? as u8,
+                                        })
+                                    })
+                                    .collect();
+                            }
+                        }
                     }
                 }
                 DaemonEvent::Error { message, .. } => {
@@ -99,8 +107,8 @@ impl App {
         }
     }
 
-    fn send(&self, method: &str, params: Value) {
-        self.rpc.request(method, params);
+    fn send(&self, method: &str, params: Value) -> Value {
+        self.rpc.request(method, params)
     }
 }
 
@@ -163,7 +171,7 @@ impl App {
                     .text("brightness")
                     .trailing_fill(true),
             );
-            if resp.drag_stopped() || resp.changed() {
+            if resp.drag_stopped() {
                 self.send("set_brightness", json!({ "pct": pct as u8 }));
             }
         });
@@ -230,7 +238,7 @@ impl App {
             ui.heading("Presets");
             if ui.button("Refresh").clicked() {
                 self.pending_presets_req = true;
-                self.send("list_presets", json!({}));
+                self.pending_presets_id = Some(self.send("list_presets", json!({})));
             }
         });
 
@@ -293,7 +301,7 @@ impl App {
                 );
                 self.save_preset_name.clear();
                 self.pending_presets_req = true;
-                self.send("list_presets", json!({}));
+                self.pending_presets_id = Some(self.send("list_presets", json!({})));
             }
         });
     }

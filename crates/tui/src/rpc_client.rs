@@ -1,21 +1,10 @@
 use l_lightning_core::rpc::{Notification, Request, Response};
+use l_lightning_core::socket_path;
 use serde_json::Value;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-
-pub fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let mut p = PathBuf::from(dir);
-        p.push("l-lightning");
-        p.push("daemon.sock");
-        p
-    } else {
-        PathBuf::from("/tmp/l-lightning.sock")
-    }
-}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -33,7 +22,6 @@ pub struct DaemonState {
 pub enum DaemonEvent {
     State(DaemonState),
     Connection(String),
-    #[allow(dead_code)]
     Response { id: Value, result: Value },
     #[allow(dead_code)]
     Error { id: Value, message: String },
@@ -136,7 +124,13 @@ impl RpcClient {
                                                 params,
                                                 id,
                                             };
-                                            let mut bytes = serde_json::to_vec(&req).unwrap_or_default();
+                                            let mut bytes = match serde_json::to_vec(&req) {
+                                                Ok(b) => b,
+                                                Err(e) => {
+                                                    eprintln!("[tui] json encode error: {e}");
+                                                    continue;
+                                                }
+                                            };
                                             bytes.push(b'\n');
                                             if writer.write_all(&bytes).await.is_err() {
                                                 let _ = event_tx.send(DaemonEvent::Disconnected);

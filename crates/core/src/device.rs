@@ -6,7 +6,6 @@ use btleplug::platform::{Adapter, Peripheral};
 use tokio::time;
 use uuid::Uuid;
 
-pub const TARGET_ADDR: &str = "BE:67:00:A5:CC:56";
 pub const WRITE_UUID: Uuid = Uuid::from_u128(0x0000fff3_0000_1000_8000_00805f9b34fb);
 pub const NOTIFY_UUID: Uuid = Uuid::from_u128(0x0000fff4_0000_1000_8000_00805f9b34fb);
 
@@ -14,14 +13,20 @@ const INTER_WRITE_DELAY_MS: u64 = 1100;
 const BLE_WRITE_TIMEOUT_MS: u64 = 5000;
 
 pub async fn find_elk(central: &Adapter) -> Result<Option<Peripheral>, btleplug::Error> {
+    let target_addr = std::env::var("L_LIGHTNING_DEVICE").ok();
     for p in central.peripherals().await? {
-        let name = p
-            .properties()
-            .await?
-            .and_then(|pr| pr.local_name)
+        let props = p.properties().await?;
+        let name = props
+            .as_ref()
+            .and_then(|pr| pr.local_name.as_deref())
             .unwrap_or_default();
         let addr = p.address().to_string();
-        if name.starts_with("ELK-BLEDOM") || addr.eq_ignore_ascii_case(TARGET_ADDR) {
+        let name_match = name.starts_with("ELK-BLEDOM");
+        let addr_match = target_addr
+            .as_ref()
+            .map(|t| addr.eq_ignore_ascii_case(t))
+            .unwrap_or(false);
+        if name_match || addr_match {
             return Ok(Some(p));
         }
     }

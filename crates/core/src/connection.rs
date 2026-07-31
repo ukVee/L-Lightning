@@ -12,6 +12,17 @@ const INTER_WRITE_MS: u64 = 1100;
 const SCAN_TIMEOUT_SECS: u64 = 60;
 const IDLE_DISCONNECT_SECS: u64 = 30;
 const BLE_WRITE_TIMEOUT_MS: u64 = 5000;
+const RECONNECT_WAIT_SECS: u64 = 2;
+
+fn is_transient_ble_error(e: &str) -> bool {
+    let msg = e.to_lowercase();
+    msg.contains("in progress")
+        || msg.contains("le-connection-abort-by-local")
+        || msg.contains("software caused connection abort")
+        || msg.contains("device or resource busy")
+        || msg.contains("connection refused")
+        || msg.contains("already")
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnState {
@@ -146,9 +157,14 @@ impl Fsm {
                             self.transition(ConnState::Idle);
                         }
                         Err(e) => {
-                            eprintln!("[l-lightning] scan error: {e}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            self.transition(ConnState::Idle);
+                            if is_transient_ble_error(&e.to_string()) {
+                                eprintln!("[l-lightning] scan transient error: {e}, retrying");
+                                tokio::time::sleep(Duration::from_secs(RECONNECT_WAIT_SECS)).await;
+                            } else {
+                                eprintln!("[l-lightning] scan error: {e}");
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                self.transition(ConnState::Idle);
+                            }
                         }
                     }
                 }
@@ -168,9 +184,15 @@ impl Fsm {
                         .await
                         .map_err(|e| e.to_string());
                     if let Err(e) = gatt_result {
-                        eprintln!("[l-lightning] connect/GATT failed: {e}");
-                        self.peripheral = None;
-                        self.transition(ConnState::Idle);
+                        if is_transient_ble_error(&e.to_string()) {
+                            eprintln!("[l-lightning] connect transient: {e}, rescanning");
+                            self.peripheral = None;
+                            self.transition(ConnState::Scanning);
+                        } else {
+                            eprintln!("[l-lightning] connect/GATT failed: {e}");
+                            self.peripheral = None;
+                            self.transition(ConnState::Idle);
+                        }
                     } else {
                         self.finish_connect(&dev).await;
                     }
@@ -181,12 +203,19 @@ impl Fsm {
                         cmd = self.cmd_rx.recv() => {
                             match cmd {
                                 Some(Cmd::ApplyState(s)) => {
-                                    if self.write_delta(&s).await.is_err() {
-                                        eprintln!("[l-lightning] write failed, disconnecting");
-                                        let _ = self.disconnect().await;
-                                        self.transition(ConnState::Idle);
-                                    } else {
-                                        *self.last_state.lock().await = s;
+                                    match self.write_delta(&s).await {
+                                        Ok(()) => {
+                                            *self.last_state.lock().await = s;
+                                        }
+                                        Err(e) => {
+                                            if is_transient_ble_error(&e.to_string()) {
+                                                eprintln!("[l-lightning] write transient: {e}, keeping link");
+                                            } else {
+                                                eprintln!("[l-lightning] write failed, disconnecting");
+                                                let _ = self.disconnect().await;
+                                                self.transition(ConnState::Idle);
+                                            }
+                                        }
                                     }
                                 }
                                 Some(Cmd::Stop) | None => {
@@ -210,10 +239,14 @@ impl Fsm {
         let _ = self.state_tx.send(new_state);
     }
 
-    async fn disconnect(&self) -> Result<(), ()> {
+    async fn disconnect(&mut self) -> Result<(), ()> {
         if let Some(ref dev) = self.peripheral {
             let _ = dev.disconnect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        self.peripheral = None;
+        self.write_char = None;
+        self.write_type = None;
         Ok(())
     }
 
@@ -278,10 +311,10 @@ impl Fsm {
         }
     }
 
-    async fn write_delta(&self, state: &DeviceState) -> Result<(), ()> {
-        let dev = self.peripheral.as_ref().ok_or(())?;
-        let ch = self.write_char.as_ref().ok_or(())?;
-        let wtype = self.write_type.ok_or(())?;
+    async fn write_delta(&self, state: &DeviceState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dev = self.peripheral.as_ref().ok_or("no peripheral")?;
+        let ch = self.write_char.as_ref().ok_or("no write characteristic")?;
+        let wtype = self.write_type.ok_or("no write type")?;
 
         let old = self.last_state.lock().await.clone();
 
@@ -292,8 +325,8 @@ impl Fsm {
                     dev.write(ch, &protocol::power_on(), wtype),
                 )
                 .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??
+                ;
                 tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
             } else {
                 tokio::time::timeout(
@@ -301,8 +334,8 @@ impl Fsm {
                     dev.write(ch, &protocol::power_off(), wtype),
                 )
                 .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??
+                ;
                 tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
                 return Ok(());
             }
@@ -314,8 +347,8 @@ impl Fsm {
                 dev.write(ch, &protocol::set_brightness(state.brightness), wtype),
             )
             .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??
+            ;
             tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
         }
 
@@ -325,8 +358,8 @@ impl Fsm {
                 dev.write(ch, &protocol::set_color(state.r, state.g, state.b), wtype),
             )
             .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??
+            ;
             tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
         }
 

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use l_lightning_core::connection::DeviceState;
@@ -65,6 +66,7 @@ pub fn load() -> Config {
 pub fn save(config: &Config) {
     let dir = config_dir();
     let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let path = config_path();
     if let Ok(raw) = toml::to_string_pretty(config) {
         let tmp = path.with_extension("tmp");

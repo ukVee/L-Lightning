@@ -21,7 +21,7 @@ impl CommandLayer {
     pub fn new(conn: Connection) -> Self {
         let min_gap = Arc::new(Mutex::new(Duration::from_millis(1100)));
         let pending = Arc::new(Mutex::new(None));
-        let last_sent = Arc::new(Mutex::new(Instant::now()));
+        let last_sent = Arc::new(Mutex::new(Instant::now() - Duration::from_millis(1100)));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let flush_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>> =
             Arc::new(StdMutex::new(None));
@@ -35,7 +35,6 @@ impl CommandLayer {
 
         let handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(10)).await;
                 if shutdown_flag_c.load(Ordering::SeqCst) {
                     if let Some(s) = pending_c.lock().await.take() {
                         conn_c.set(s);
@@ -43,14 +42,17 @@ impl CommandLayer {
                     break;
                 }
                 let gap = *min_gap_c.lock().await;
-                let mut last = last_sent_c.lock().await;
-                if last.elapsed() >= gap {
+                let elapsed = last_sent_c.lock().await.elapsed();
+                if elapsed >= gap {
                     let mut p = pending_c.lock().await;
                     if let Some(s) = p.take() {
                         conn_c.set(s);
-                        *last = Instant::now();
+                        *last_sent_c.lock().await = Instant::now();
+                        tokio::time::sleep(gap).await;
+                        continue;
                     }
                 }
+                tokio::time::sleep(gap.saturating_sub(elapsed)).await;
             }
         });
 
@@ -138,6 +140,27 @@ impl CommandLayer {
             },
         ];
 
+        let mut attempts = 0;
+        loop {
+            if attempts >= 3 {
+                eprintln!("[l-lightning] discover_min_gap: could not reach Connected, giving up");
+                return last_good;
+            }
+            match self.conn.state() {
+                ConnState::Connected => break,
+                ConnState::Idle => {
+                    eprintln!("[l-lightning] discover_min_gap: idle, sending wake command (attempt {})", attempts + 1);
+                    self.apply(test_states[0].clone()).await;
+                    tokio::time::sleep(Duration::from_secs(12)).await;
+                }
+                other => {
+                    eprintln!("[l-lightning] discover_min_gap: state is {:?}, waiting (attempt {})", other, attempts + 1);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+            attempts += 1;
+        }
+
         for &gap_ms in &candidates {
             let gap = Duration::from_millis(gap_ms);
             self.set_gap(gap).await;
@@ -149,9 +172,20 @@ impl CommandLayer {
 
             tokio::time::sleep(Duration::from_secs(2)).await;
 
-            match self.conn.state() {
-                ConnState::Connected => last_good = gap,
-                _ => return last_good,
+            let cs = self.conn.state();
+            if cs == ConnState::Connected {
+                last_good = gap;
+            } else {
+                eprintln!(
+                    "[l-lightning] discover_min_gap: gap {}ms lost link (state: {:?}), best was {}ms",
+                    gap_ms, cs, last_good.as_millis()
+                );
+                if cs == ConnState::Idle {
+                    eprintln!(
+                        "[l-lightning] discover_min_gap: went to Idle — likely write failure, not idle timeout"
+                    );
+                }
+                return last_good;
             }
         }
 

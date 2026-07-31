@@ -61,7 +61,6 @@ async fn run_effect(
 ) {
     let period = Duration::from_millis(params.speed);
     let start = tokio::time::Instant::now();
-    let mut tick: u64 = 0;
 
     let initial_hsv = rgb_to_hsv(state.r, state.g, state.b);
 
@@ -78,7 +77,7 @@ async fn run_effect(
             EffectKind::ColorCycle => {
                 frame_color_cycle(&state, &initial_hsv, elapsed, params.speed)
             }
-            EffectKind::Strobe => frame_strobe(&state, tick),
+            EffectKind::Strobe => frame_strobe(&state, elapsed, params.speed),
             EffectKind::FadeTo => {
                 match frame_fade_to(&state, params.target.as_ref()) {
                     Some(next) => next,
@@ -88,7 +87,6 @@ async fn run_effect(
         };
 
         cmd_layer.apply(state.clone()).await;
-        tick += 1;
     }
 }
 
@@ -102,7 +100,7 @@ pub fn effect_label(kind: &EffectKind) -> &str {
 }
 
 fn frame_breathe(state: &DeviceState, elapsed: Duration, speed: u64) -> DeviceState {
-    let period_ms = (speed * 100) as f64;
+    let period_ms = (speed.saturating_mul(100)) as f64;
     let t_secs = elapsed.as_millis() as f64 / 1000.0;
     let cycle = (t_secs * std::f64::consts::TAU / (period_ms / 1000.0)).sin();
     let brightness = (((cycle + 1.0) / 2.0) * 100.0).round() as u8;
@@ -121,7 +119,7 @@ fn frame_color_cycle(
     speed: u64,
 ) -> DeviceState {
     let (_, s, v) = *initial_hsv;
-    let rotation_ms = (speed * 200) as f64;
+    let rotation_ms = (speed.saturating_mul(200)) as f64;
     let t_secs = elapsed.as_millis() as f64 / 1000.0;
     let hue = (t_secs * 360.0 / (rotation_ms / 1000.0)) % 360.0;
 
@@ -135,8 +133,9 @@ fn frame_color_cycle(
     }
 }
 
-fn frame_strobe(state: &DeviceState, tick: u64) -> DeviceState {
-    let power = tick.is_multiple_of(2);
+fn frame_strobe(state: &DeviceState, elapsed: Duration, speed: u64) -> DeviceState {
+    let half_period_ms = speed.max(50);
+    let power = (elapsed.as_millis() as u64 / half_period_ms).is_multiple_of(2);
     DeviceState { power, ..*state }
 }
 
